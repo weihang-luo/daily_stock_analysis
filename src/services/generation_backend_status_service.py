@@ -17,8 +17,16 @@ from src.config import (
     _uses_direct_env_provider,
     channel_allows_empty_api_key,
     get_configured_llm_models,
+    is_supported_llm_channel_api_surface_value,
+    find_incompatible_llm_channel_models,
+    find_llm_channel_surface_conflicts,
+    normalize_llm_channel_api_surface,
     normalize_llm_channel_model,
     parse_env_bool,
+    resolve_llm_channel_base_url,
+    resolve_llm_channel_models,
+    resolve_llm_channel_api_keys,
+    resolve_llm_channel_names,
     resolve_llm_channel_protocol,
 )
 from src.llm.backend_registry import (
@@ -826,7 +834,7 @@ class GenerationBackendStatusService:
     @classmethod
     def _parse_llm_channels_from_map(cls, effective_map: Dict[str, str]) -> List[Dict[str, Any]]:
         channels: List[Dict[str, Any]] = []
-        for raw_name in cls._split_csv(effective_map.get("LLM_CHANNELS") or ""):
+        for raw_name in cls._split_csv(resolve_llm_channel_names(effective_map)):
             name = raw_name.strip()
             if not name:
                 continue
@@ -838,12 +846,16 @@ class GenerationBackendStatusService:
             if not parse_env_bool(enabled_raw, default=True):
                 continue
 
-            base_url = (effective_map.get(f"{prefix}_BASE_URL") or "").strip() or None
+            base_url = resolve_llm_channel_base_url(name, effective_map.get(f"{prefix}_BASE_URL")) or None
             if lower == "anspire" and not base_url:
                 base_url = (effective_map.get("ANSPIRE_LLM_BASE_URL") or ANSPIRE_LLM_BASE_URL_DEFAULT).strip() or None
             protocol_raw = (effective_map.get(f"{prefix}_PROTOCOL") or "").strip()
             if lower == "anspire" and not protocol_raw:
                 protocol_raw = "openai"
+            api_surface_raw = (effective_map.get(f"{prefix}_API_SURFACE") or "").strip()
+            if not is_supported_llm_channel_api_surface_value(api_surface_raw):
+                continue
+            api_surface = normalize_llm_channel_api_surface(api_surface_raw)
 
             api_keys = cls._split_csv(effective_map.get(f"{prefix}_API_KEYS") or "")
             single_key = (effective_map.get(f"{prefix}_API_KEY") or "").strip()
@@ -851,12 +863,20 @@ class GenerationBackendStatusService:
                 api_keys = [single_key]
             if lower == "anspire" and not api_keys:
                 api_keys = cls._split_csv(effective_map.get("ANSPIRE_API_KEYS") or "")
+            api_keys = resolve_llm_channel_api_keys(name, api_keys, effective_map)
 
             raw_models = cls._split_csv(effective_map.get(f"{prefix}_MODELS") or "")
+            raw_models = resolve_llm_channel_models(
+                name, raw_models, channel_names=resolve_llm_channel_names(effective_map),
+                primary_model=effective_map.get("LITELLM_MODEL") or "",
+                fallback_models=effective_map.get("LITELLM_FALLBACK_MODELS") or "",
+            )
             if lower == "anspire" and not raw_models:
                 raw_models = [(effective_map.get("ANSPIRE_LLM_MODEL") or ANSPIRE_LLM_MODEL_DEFAULT).strip()]
 
             if is_reserved_hermes_name(name):
+                if api_surface == "responses":
+                    continue
                 result = parse_hermes_channel(
                     enabled=True,
                     protocol=protocol_raw or HERMES_DEFAULT_PROTOCOL,
@@ -871,6 +891,10 @@ class GenerationBackendStatusService:
                 continue
 
             protocol = resolve_llm_channel_protocol(protocol_raw, base_url=base_url, models=raw_models, channel_name=name)
+            if api_surface == "responses" and protocol != "openai":
+                continue
+            if find_incompatible_llm_channel_models(raw_models, protocol, api_surface, base_url):
+                continue
             models = [normalize_llm_channel_model(model, protocol, base_url) for model in raw_models]
             if not api_keys and channel_allows_empty_api_key(protocol, base_url):
                 api_keys = [""]
@@ -882,6 +906,7 @@ class GenerationBackendStatusService:
                 {
                     "name": lower,
                     "protocol": protocol,
+                    "api_surface": api_surface,
                     "enabled": True,
                     "base_url": base_url,
                     "api_keys": api_keys,
@@ -889,7 +914,14 @@ class GenerationBackendStatusService:
                     "extra_headers": extra_headers,
                 }
             )
-        return channels
+        surface_conflicts = set(find_llm_channel_surface_conflicts(channels))
+        if not surface_conflicts:
+            return channels
+        return [
+            channel
+            for channel in channels
+            if not set(channel.get("models") or []).intersection(surface_conflicts)
+        ]
 
     @staticmethod
     def _parse_json_object(value: str) -> Optional[Dict[str, Any]]:

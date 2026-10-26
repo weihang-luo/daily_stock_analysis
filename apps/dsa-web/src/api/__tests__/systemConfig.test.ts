@@ -33,6 +33,25 @@ describe('systemConfigApi', () => {
     });
   });
 
+  it('maps backend LiteLLM provider metadata into the Web config contract', async () => {
+    get.mockResolvedValueOnce({
+      data: {
+        config_version: 'v1',
+        mask_token: '******',
+        items: [],
+        llm_model_providers: ['openai', 'xai'],
+        updated_at: null,
+      },
+    });
+
+    const config = await systemConfigApi.getConfig(false);
+
+    expect(get).toHaveBeenCalledWith('/api/v1/system/config', {
+      params: { include_schema: false },
+    });
+    expect(config.llmModelProviders).toEqual(['openai', 'xai']);
+  });
+
   it('omits capability_checks from basic LLM channel test payloads', async () => {
     await systemConfigApi.testLLMChannel({
       name: 'openai',
@@ -61,6 +80,22 @@ describe('systemConfigApi', () => {
     expect(post).toHaveBeenCalledWith(
       '/api/v1/system/config/llm/test-channel',
       expect.objectContaining({ capability_checks: ['json', 'stream'] }),
+    );
+  });
+
+  it('sends the selected LLM API surface', async () => {
+    await systemConfigApi.testLLMChannel({
+      name: 'anspire',
+      protocol: 'openai',
+      apiSurface: 'responses',
+      baseUrl: 'https://open-gateway.anspire.cn/v6',
+      apiKey: 'sk-test',
+      models: ['gpt-5.6-sol'],
+    });
+
+    expect(post).toHaveBeenCalledWith(
+      '/api/v1/system/config/llm/test-channel',
+      expect.objectContaining({ api_surface: 'responses' }),
     );
   });
 
@@ -277,10 +312,10 @@ describe('systemConfigApi', () => {
   it('loads the flat Agent backend compatibility status', async () => {
     get.mockResolvedValueOnce({
       data: {
-        backend: 'codex_app_server',
+        backend: 'litellm',
         available: true,
-        experimental: true,
-        version: 'codex-cli test',
+        experimental: false,
+        version: null,
         error_code: null,
         message: null,
       },
@@ -290,10 +325,10 @@ describe('systemConfigApi', () => {
 
     expect(get).toHaveBeenCalledWith('/api/v1/system/config/agent-backends/status');
     expect(result).toEqual({
-      backend: 'codex_app_server',
+      backend: 'litellm',
       available: true,
-      experimental: true,
-      version: 'codex-cli test',
+      experimental: false,
+      version: null,
       errorCode: null,
       message: null,
     });
@@ -304,10 +339,10 @@ describe('systemConfigApi', () => {
       data: {
         backend: 'codex_app_server',
         available: false,
-        experimental: true,
+        experimental: false,
         version: null,
-        error_code: 'unsupported_agent_arch',
-        message: 'single only',
+        error_code: 'backend_removed',
+        message: 'Codex App Server has been removed',
       },
     });
 
@@ -326,7 +361,7 @@ describe('systemConfigApi', () => {
       ],
       mask_token: '***',
     });
-    expect(result.errorCode).toBe('unsupported_agent_arch');
-    expect(result.message).toBe('single only');
+    expect(result.errorCode).toBe('backend_removed');
+    expect(result.message).toBe('Codex App Server has been removed');
   });
 });

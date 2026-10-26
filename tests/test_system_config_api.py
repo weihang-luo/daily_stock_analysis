@@ -111,6 +111,8 @@ class SystemConfigApiTestCase(unittest.TestCase):
     def test_get_config_keeps_regular_secret_value_unmasked(self) -> None:
         payload = system_config.get_system_config(include_schema=True, service=self.service).model_dump(by_alias=True)
         item_map = {item["key"]: item for item in payload["items"]}
+        self.assertIn("openai", payload["llm_model_providers"])
+        self.assertIn("xai", payload["llm_model_providers"])
         self.assertEqual(item_map["GEMINI_API_KEY"]["value"], "secret-key-value")
         self.assertFalse(item_map["GEMINI_API_KEY"]["is_masked"])
 
@@ -169,7 +171,7 @@ class SystemConfigApiTestCase(unittest.TestCase):
         backend_schema = item_map["AGENT_BACKEND"]["schema"]
         self.assertEqual(
             backend_schema["validation"]["enum"],
-            ["auto", "litellm", "codex_app_server"],
+            ["auto", "litellm"],
         )
         generation_schema = item_map["GENERATION_BACKEND"]["schema"]
         self.assertIn("claude_code_cli", generation_schema["validation"]["enum"])
@@ -290,54 +292,15 @@ class SystemConfigApiTestCase(unittest.TestCase):
         before = self.env_path.read_text(encoding="utf-8")
         before_version = self.manager.get_config_version()
 
-        def fake_run(command, **kwargs):
-            if command[-1] == "--version":
-                return SimpleNamespace(returncode=0, stdout="codex-cli test\n")
-            if "generate-json-schema" in command:
-                schema_dir = Path(command[command.index("--out") + 1])
-                (schema_dir / "v2").mkdir(parents=True, exist_ok=True)
-                (schema_dir / "v2" / "ThreadStartParams.json").write_text(
-                    '{"properties":{"dynamicTools":{},"runtimeWorkspaceRoots":{}}}',
-                    encoding="utf-8",
-                )
-                (schema_dir / "v2" / "ThreadStartResponse.json").write_text(
-                    '{"properties":{"activePermissionProfile":{},"runtimeWorkspaceRoots":{}}}',
-                    encoding="utf-8",
-                )
-                (schema_dir / "ClientRequest.json").write_text(
-                    '["thread/inject_items","turn/start","turn/interrupt","config/read","mcpServerStatus/list"]',
-                    encoding="utf-8",
-                )
-                (schema_dir / "ServerRequest.json").write_text(
-                    '{"const":"item/tool/call"}',
-                    encoding="utf-8",
-                )
-                (schema_dir / "ServerNotification.json").write_text(
-                    '["item/completed","turn/completed"]',
-                    encoding="utf-8",
-                )
-            return SimpleNamespace(returncode=0, stdout="")
-
-        with (
-            patch(
-                "src.services.agent_backend_status_service.resolve_command",
-                return_value=["/test/codex"],
-            ),
-            patch("src.services.agent_backend_status_service._run_codex_probe", side_effect=fake_run),
-        ):
+        with patch("subprocess.Popen", side_effect=AssertionError("preview must not launch a process")):
             payload = system_config.preview_agent_backend_status(
-                request=AgentBackendStatusPreviewRequest(
-                    items=[
-                        {"key": "AGENT_BACKEND", "value": "codex_app_server"},
-                        {"key": "AGENT_ARCH", "value": "single"},
-                    ]
-                ),
+                request=AgentBackendStatusPreviewRequest(items=[{"key": "AGENT_BACKEND", "value": "codex_app_server"}]),
                 service=self.service,
             ).model_dump()
-
         self.assertEqual(payload["backend"], "codex_app_server")
-        self.assertTrue(payload["available"])
-        self.assertEqual(payload["version"], "codex-cli test")
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["error_code"], "backend_removed")
+        self.assertIsNone(payload["version"])
         self.assertEqual(self.env_path.read_text(encoding="utf-8"), before)
         self.assertEqual(self.manager.get_config_version(), before_version)
 
@@ -354,7 +317,7 @@ class SystemConfigApiTestCase(unittest.TestCase):
 
         self.assertEqual(payload["backend"], "codex_app_server")
         self.assertFalse(payload["available"])
-        self.assertEqual(payload["error_code"], "unsupported_agent_arch")
+        self.assertEqual(payload["error_code"], "backend_removed")
 
     def test_put_config_updates_secret_and_plain_field(self) -> None:
         current = system_config.get_system_config(include_schema=False, service=self.service).model_dump()
@@ -842,6 +805,7 @@ class SystemConfigApiTestCase(unittest.TestCase):
                 "retryable": False,
                 "details": {},
                 "resolved_protocol": "openai",
+                "resolved_api_surface": "responses",
                 "resolved_model": "openai/gpt-4o-mini",
                 "latency_ms": 123,
             },
@@ -850,6 +814,7 @@ class SystemConfigApiTestCase(unittest.TestCase):
                 request=TestLLMChannelRequest(
                     name="primary",
                     protocol="openai",
+                    api_surface="responses",
                     base_url="https://api.example.com/v1",
                     api_key="sk-test",
                     models=["gpt-4o-mini"],
@@ -860,10 +825,12 @@ class SystemConfigApiTestCase(unittest.TestCase):
 
         self.assertTrue(payload["success"])
         self.assertEqual(payload["resolved_model"], "openai/gpt-4o-mini")
+        self.assertEqual(payload["resolved_api_surface"], "responses")
         self.assertEqual(payload["stage"], "chat_completion")
         self.assertEqual(payload["capability_results"], {})
         mock_test.assert_called_once()
         self.assertEqual(mock_test.call_args.kwargs["capability_checks"], ["json", "stream"])
+        self.assertEqual(mock_test.call_args.kwargs["api_surface"], "responses")
 
     def test_test_notification_channel_endpoint_returns_service_payload(self) -> None:
         with patch.object(
@@ -909,7 +876,19 @@ class SystemConfigApiTestCase(unittest.TestCase):
         self.assertEqual(mock_test.call_args.kwargs["channel"], "wechat")
         self.assertEqual(mock_test.call_args.kwargs["timeout_seconds"], 5)
 
-    def test_test_notification_channel_schema_accepts_p6_channels(self) -> None:
+    def test_test_notification_channel_schema_accepts_registered_channels(self) -> None:
+        dingtalk_request = TestNotificationChannelRequest(
+            channel="dingtalk",
+            items=[
+                {
+                    "key": "DINGTALK_WEBHOOK_URL",
+                    "value": "https://oapi.dingtalk.com/robot/send?access_token=test",
+                }
+            ],
+            title="DSA 閫氱煡娴嬭瘯",
+            content="hello",
+            timeout_seconds=5,
+        )
         ntfy_request = TestNotificationChannelRequest(
             channel="ntfy",
             items=[{"key": "NTFY_URL", "value": "https://ntfy.sh/dsa-topic"}],
@@ -928,6 +907,7 @@ class SystemConfigApiTestCase(unittest.TestCase):
             timeout_seconds=5,
         )
 
+        self.assertEqual(dingtalk_request.channel, "dingtalk")
         self.assertEqual(ntfy_request.channel, "ntfy")
         self.assertEqual(gotify_request.channel, "gotify")
 
